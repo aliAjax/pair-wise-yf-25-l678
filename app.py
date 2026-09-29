@@ -1,4 +1,8 @@
-"""学术会议同行评审系统：标准库 + SQLite 的可运行示例。"""
+"""学术会议同行评审系统：标准库 + SQLite 的可运行示例。
+
+轨道权限见 ``tracks.py``，分配/改轨事务见 ``assignments.py``，
+主席控制台页面见 ``web/chair.html``。
+"""
 from __future__ import annotations
 
 import argparse
@@ -6,27 +10,19 @@ import hashlib
 import json
 import sqlite3
 import threading
-from datetime import datetime, timezone
-from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+import assignments
+import tracks
+from domain import VALID_DECISIONS, BusinessError, PAPER_OPEN_STATUSES, utcnow
+
+# 兼容既有测试与外部引用：``from app import BusinessError``。
+__all__ = ["BusinessError", "ReviewStore", "ReviewHandler", "ReviewServer"]
+
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = BASE_DIR / "review.db"
-VALID_DECISIONS = {"accept", "reject", "minor_revision", "major_revision"}
-
-
-class BusinessError(Exception):
-    def __init__(self, message: str, status: int = 400, code: str = "bad_request"):
-        super().__init__(message)
-        self.message = message
-        self.status = status
-        self.code = code
-
-
-def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 class ReviewStore:
@@ -56,10 +52,13 @@ class ReviewStore:
                 CREATE TABLE IF NOT EXISTS papers (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     author_id TEXT NOT NULL REFERENCES users(id),
+                    track_id TEXT NOT NULL DEFAULT 'db' REFERENCES tracks(id),
                     title TEXT NOT NULL,
                     abstract TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'submitted'
                         CHECK (status IN ('submitted','under_review','decided','withdrawn')),
+                    -- 轨道纪元：每次改轨 +1，用于判定邀请/评审属于哪一轨。
+                    track_seq INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS paper_versions (
@@ -90,13 +89,15 @@ class ReviewStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     paper_id INTEGER NOT NULL REFERENCES papers(id),
                     reviewer_id TEXT NOT NULL REFERENCES users(id),
-                    status TEXT NOT NULL DEFAULT 'invited'
-                        CHECK (status IN ('invited','accepted','declined','completed')),
+                    track_id TEXT NOT NULL REFERENCES tracks(id),
+                    track_seq INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'invited' CHECK (status IN (
+                        'invited','accepted','declined','completed','withdrawn','archived')),
                     score INTEGER CHECK (score IS NULL OR score BETWEEN 1 AND 5),
                     review_text TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    UNIQUE (paper_id, reviewer_id)
+                    UNIQUE (paper_id, reviewer_id, track_seq)
                 );
                 CREATE TABLE IF NOT EXISTS rebuttals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,6 +124,47 @@ class ReviewStore:
                     FOREIGN KEY (paper_id) REFERENCES papers(id)
                 );
                 """
+                + tracks.SCHEMA
+            )
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """把旧库（无轨道概念）补齐到分轨结构。"""
+        paper_cols = {r["name"] for r in conn.execute("PRAGMA table_info(papers)")}
+        if "track_id" not in paper_cols:
+            conn.execute("ALTER TABLE papers ADD COLUMN track_id TEXT NOT NULL DEFAULT 'db'")
+        if "track_seq" not in paper_cols:
+            conn.execute("ALTER TABLE papers ADD COLUMN track_seq INTEGER NOT NULL DEFAULT 1")
+        assign_cols = {r["name"] for r in conn.execute("PRAGMA table_info(assignments)")}
+        if "track_id" not in assign_cols:
+            # 旧表的 CHECK 与 UNIQUE(paper_id,reviewer_id) 无法就地改，整表重建：
+            # 改轨后同一评审人可在新轨再次被邀请，唯一性改为 (paper_id,reviewer_id,track_seq)。
+            conn.executescript(
+                """
+                ALTER TABLE assignments RENAME TO assignments_old;
+                CREATE TABLE assignments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    paper_id INTEGER NOT NULL REFERENCES papers(id),
+                    reviewer_id TEXT NOT NULL REFERENCES users(id),
+                    track_id TEXT NOT NULL,
+                    track_seq INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'invited' CHECK (status IN (
+                        'invited','accepted','declined','completed','withdrawn','archived')),
+                    score INTEGER CHECK (score IS NULL OR score BETWEEN 1 AND 5),
+                    review_text TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (paper_id, reviewer_id, track_seq)
+                );
+                INSERT INTO assignments
+                    (id,paper_id,reviewer_id,track_id,track_seq,status,score,review_text,created_at,updated_at)
+                SELECT a.id,a.paper_id,a.reviewer_id,
+                       COALESCE(p.track_id,'db'),COALESCE(p.track_seq,1),
+                       a.status,a.score,a.review_text,a.created_at,a.updated_at
+                  FROM assignments_old a JOIN papers p ON p.id=a.paper_id;
+                DROP TABLE assignments_old;
+                """
             )
 
     def seed(self) -> None:
@@ -133,12 +175,13 @@ class ReviewStore:
             ("r1", "评审人一号", "reviewer", 3),
             ("r2", "评审人二号", "reviewer", 3),
             ("r3", "评审人三号", "reviewer", 2),
-            ("chair", "程序委员会主席", "chair", 0),
+            ("chair", "程序委员会总主席", "chair", 0),
         ]
         with self.connect() as conn:
             conn.executemany(
                 "INSERT OR IGNORE INTO users(id,name,role,load_limit) VALUES(?,?,?,?)", users
             )
+            tracks.seed(conn, utcnow())
 
     def _user(self, conn: sqlite3.Connection, user_id: str | None) -> sqlite3.Row:
         if not user_id:
@@ -159,31 +202,37 @@ class ReviewStore:
             (paper_id, actor, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), utcnow()),
         )
 
-    def submit_paper(self, user_id: str, title: str, abstract: str) -> dict:
+    def submit_paper(self, user_id: str, title: str, abstract: str, track_id: str) -> dict:
         title, abstract = title.strip(), abstract.strip()
         if len(title) < 3 or len(abstract) < 20:
             raise BusinessError("标题至少 3 字，摘要至少 20 字", 422, "invalid_paper")
+        if not track_id:
+            raise BusinessError("投稿必须选择轨道", 422, "track_required")
         digest = hashlib.sha256(f"{title}\n{abstract}".encode()).hexdigest()
         with self.connect() as conn:
             user = self._user(conn, user_id)
             self._require(user, "author")
+            tracks.require_track_exists(conn, track_id)
             cur = conn.execute(
-                "INSERT INTO papers(author_id,title,abstract,created_at) VALUES(?,?,?,?)",
-                (user_id, title, abstract, utcnow()),
+                "INSERT INTO papers(author_id,track_id,title,abstract,created_at) VALUES(?,?,?,?,?)",
+                (user_id, track_id, title, abstract, utcnow()),
             )
             paper_id = cur.lastrowid
             conn.execute(
                 "INSERT INTO paper_versions(paper_id,version,content_hash,created_at) VALUES(?,?,?,?)",
                 (paper_id, 1, digest, utcnow()),
             )
-            self._audit(conn, paper_id, user_id, "paper.submit", {"version": 1, "sha256": digest})
-            return {"id": paper_id, "status": "submitted", "version": 1, "sha256": digest}
+            self._audit(conn, paper_id, user_id, "paper.submit",
+                        {"version": 1, "sha256": digest, "track_id": track_id})
+            return {"id": paper_id, "status": "submitted", "version": 1,
+                    "sha256": digest, "track_id": track_id}
 
     def _paper_view(self, conn: sqlite3.Connection, paper: sqlite3.Row, viewer: sqlite3.Row) -> dict:
         data = {
             "id": paper["id"],
             "title": paper["title"],
             "abstract": paper["abstract"],
+            "track_id": paper["track_id"],
             "status": paper["status"],
             "created_at": paper["created_at"],
         }
@@ -197,7 +246,13 @@ class ReviewStore:
         with self.connect() as conn:
             user = self._user(conn, user_id)
             if user["role"] == "chair":
-                rows = conn.execute("SELECT * FROM papers ORDER BY id").fetchall()
+                bound = tracks.chair_track(conn, user_id)
+                if bound is None:
+                    rows = conn.execute("SELECT * FROM papers ORDER BY id").fetchall()  # 总主席跨轨
+                else:
+                    rows = conn.execute(
+                        "SELECT * FROM papers WHERE track_id=? ORDER BY id", (bound,)
+                    ).fetchall()  # 专题主席只见本轨
             elif user["role"] == "author":
                 rows = conn.execute("SELECT * FROM papers WHERE author_id=? ORDER BY id", (user_id,)).fetchall()
             else:
@@ -216,14 +271,18 @@ class ReviewStore:
             paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
             if not paper:
                 raise BusinessError("论文不存在", 404, "not_found")
-            if user["role"] == "reviewer":
+            if user["role"] == "chair":
+                bound = tracks.chair_track(conn, user_id)
+                if bound is not None and bound != paper["track_id"]:
+                    raise BusinessError("专题主席只能查看本轨论文", 403, "track_scope_violation")
+            elif user["role"] == "reviewer":
                 allowed = conn.execute(
                     "SELECT 1 FROM assignments WHERE paper_id=? AND reviewer_id=? UNION SELECT 1 FROM bids WHERE paper_id=? AND reviewer_id=?",
                     (paper_id, user_id, paper_id, user_id),
                 ).fetchone()
                 if not allowed:
                     raise BusinessError("评审人未获授权查看该论文", 403, "forbidden")
-            elif user["role"] == "author" and paper["author_id"] != user_id:
+            elif paper["author_id"] != user_id:
                 raise BusinessError("作者只能查看自己的论文", 403, "forbidden")
             return self._paper_view(conn, paper, user)
 
@@ -233,8 +292,10 @@ class ReviewStore:
         with self.connect() as conn:
             chair = self._user(conn, chair_id)
             self._require(chair, "chair")
-            if not conn.execute("SELECT 1 FROM papers WHERE id=?", (paper_id,)).fetchone():
+            paper = conn.execute("SELECT track_id FROM papers WHERE id=?", (paper_id,)).fetchone()
+            if not paper:
                 raise BusinessError("论文不存在", 404, "not_found")
+            tracks.require_chair_scope(conn, chair, paper["track_id"])
             reviewer = self._user(conn, reviewer_id)
             self._require(reviewer, "reviewer")
             try:
@@ -244,7 +305,8 @@ class ReviewStore:
                 )
             except sqlite3.IntegrityError:
                 raise BusinessError("利益冲突已登记", 409, "conflict_exists")
-            self._audit(conn, paper_id, chair_id, "conflict.add", {"reviewer_id": reviewer_id, "reason": reason.strip()})
+            self._audit(conn, paper_id, chair_id, "conflict.add",
+                        {"reviewer_id": reviewer_id, "reason": reason.strip()})
             return {"paper_id": paper_id, "reviewer_id": reviewer_id, "reason": reason.strip()}
 
     def bid(self, reviewer_id: str, paper_id: int, interest: str, note: str = "") -> dict:
@@ -253,9 +315,12 @@ class ReviewStore:
         with self.connect() as conn:
             reviewer = self._user(conn, reviewer_id)
             self._require(reviewer, "reviewer")
-            paper = conn.execute("SELECT status FROM papers WHERE id=?", (paper_id,)).fetchone()
-            if not paper or paper["status"] not in {"submitted", "under_review"}:
+            paper = conn.execute(
+                "SELECT track_id,status FROM papers WHERE id=?", (paper_id,)
+            ).fetchone()
+            if not paper or paper["status"] not in PAPER_OPEN_STATUSES:
                 raise BusinessError("论文不存在或当前不可表达意向", 409, "paper_unavailable")
+            tracks.require_reviewer_in_track(conn, reviewer_id, paper["track_id"])  # 意向必须同轨
             if conn.execute("SELECT 1 FROM conflicts WHERE reviewer_id=? AND paper_id=?", (reviewer_id, paper_id)).fetchone():
                 raise BusinessError("存在利益冲突，不能表达评审意向", 409, "conflict_of_interest")
             conn.execute(
@@ -263,76 +328,23 @@ class ReviewStore:
                    ON CONFLICT(reviewer_id,paper_id) DO UPDATE SET interest=excluded.interest,note=excluded.note,created_at=excluded.created_at""",
                 (reviewer_id, paper_id, interest, note.strip(), utcnow()),
             )
-            self._audit(conn, paper_id, reviewer_id, "bid.set", {"interest": interest, "note": note.strip()})
-            return {"paper_id": paper_id, "reviewer_id": reviewer_id, "interest": interest}
+            self._audit(conn, paper_id, reviewer_id, "bid.set",
+                        {"interest": interest, "note": note.strip(), "track_id": paper["track_id"]})
+            return {"paper_id": paper_id, "reviewer_id": reviewer_id,
+                    "interest": interest, "track_id": paper["track_id"]}
 
+    # 邀请 / 回应 / 评审提交 / 改轨的事务逻辑在 assignments.py，这里只做转发。
     def assign(self, chair_id: str, paper_id: int, reviewer_id: str) -> dict:
-        with self.connect() as conn:
-            chair = self._user(conn, chair_id)
-            self._require(chair, "chair")
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
-                if not paper or paper["status"] not in {"submitted", "under_review"}:
-                    raise BusinessError("论文不存在或不可分配", 409, "paper_unavailable")
-                reviewer = self._user(conn, reviewer_id)
-                self._require(reviewer, "reviewer")
-                if conn.execute("SELECT 1 FROM conflicts WHERE reviewer_id=? AND paper_id=?", (reviewer_id, paper_id)).fetchone():
-                    raise BusinessError("评审人与论文存在利益冲突", 409, "conflict_of_interest")
-                load = conn.execute(
-                    "SELECT COUNT(*) FROM assignments WHERE reviewer_id=? AND status IN ('invited','accepted')",
-                    (reviewer_id,),
-                ).fetchone()[0]
-                if load >= reviewer["load_limit"]:
-                    raise BusinessError("评审人已达到负载上限", 409, "reviewer_at_capacity")
-                try:
-                    cur = conn.execute(
-                        "INSERT INTO assignments(paper_id,reviewer_id,created_at,updated_at) VALUES(?,?,?,?)",
-                        (paper_id, reviewer_id, utcnow(), utcnow()),
-                    )
-                except sqlite3.IntegrityError:
-                    raise BusinessError("该评审人已被分配此论文", 409, "assignment_exists")
-                conn.execute("UPDATE papers SET status='under_review' WHERE id=?", (paper_id,))
-                assignment_id = cur.lastrowid
-                self._audit(conn, paper_id, chair_id, "assignment.invite", {"assignment_id": assignment_id, "reviewer_id": reviewer_id})
-                return {"id": assignment_id, "paper_id": paper_id, "reviewer_id": reviewer_id, "status": "invited"}
-            except Exception:
-                conn.rollback()
-                raise
+        return assignments.invite(self, chair_id, paper_id, reviewer_id)
 
     def respond_assignment(self, reviewer_id: str, assignment_id: int, accepted: bool) -> dict:
-        with self.connect() as conn:
-            reviewer = self._user(conn, reviewer_id)
-            self._require(reviewer, "reviewer")
-            row = conn.execute("SELECT * FROM assignments WHERE id=?", (assignment_id,)).fetchone()
-            if not row or row["reviewer_id"] != reviewer_id:
-                raise BusinessError("分配不存在或不属于当前评审人", 404, "not_found")
-            if row["status"] != "invited":
-                raise BusinessError("邀请已经处理", 409, "invitation_already_answered")
-            status = "accepted" if accepted else "declined"
-            conn.execute("UPDATE assignments SET status=?,updated_at=? WHERE id=?", (status, utcnow(), assignment_id))
-            self._audit(conn, row["paper_id"], reviewer_id, "assignment.respond", {"assignment_id": assignment_id, "status": status})
-            return {"id": assignment_id, "status": status}
+        return assignments.respond(self, reviewer_id, assignment_id, accepted)
 
     def submit_review(self, reviewer_id: str, assignment_id: int, score: int, text: str) -> dict:
-        if isinstance(score, bool) or not isinstance(score, int) or not 1 <= score <= 5:
-            raise BusinessError("评分必须是 1 到 5 的整数", 422, "invalid_score")
-        if len(text.strip()) < 10:
-            raise BusinessError("评审意见至少 10 字", 422, "review_too_short")
-        with self.connect() as conn:
-            reviewer = self._user(conn, reviewer_id)
-            self._require(reviewer, "reviewer")
-            row = conn.execute("SELECT * FROM assignments WHERE id=?", (assignment_id,)).fetchone()
-            if not row or row["reviewer_id"] != reviewer_id:
-                raise BusinessError("分配不存在或不属于当前评审人", 404, "not_found")
-            if row["status"] != "accepted":
-                raise BusinessError("只有已接受邀请的评审人可以提交评审", 409, "invalid_assignment_state")
-            conn.execute(
-                "UPDATE assignments SET status='completed',score=?,review_text=?,updated_at=? WHERE id=?",
-                (score, text.strip(), utcnow(), assignment_id),
-            )
-            self._audit(conn, row["paper_id"], reviewer_id, "review.submit", {"assignment_id": assignment_id, "score": score})
-            return {"id": assignment_id, "status": "completed", "score": score}
+        return assignments.submit_review(self, reviewer_id, assignment_id, score, text)
+
+    def move_paper(self, actor_id: str, paper_id: int, target_track: str, reason: str) -> dict:
+        return assignments.move_paper(self, actor_id, paper_id, target_track, reason)
 
     def submit_rebuttal(self, author_id: str, paper_id: int, content: str) -> dict:
         if len(content.strip()) < 10:
@@ -343,9 +355,9 @@ class ReviewStore:
             paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
             if not paper or paper["author_id"] != author_id:
                 raise BusinessError("论文不存在或不属于当前作者", 404, "not_found")
-            completed = conn.execute("SELECT COUNT(*) FROM assignments WHERE paper_id=? AND status='completed'", (paper_id,)).fetchone()[0]
+            completed = assignments.count_valid_completed(conn, paper_id)
             if completed < 1:
-                raise BusinessError("至少收到一份完整评审后才能提交 Rebuttal", 409, "reviews_not_ready")
+                raise BusinessError("至少收到一份当前轨道的完整评审后才能提交 Rebuttal", 409, "reviews_not_ready")
             try:
                 cur = conn.execute(
                     "INSERT INTO rebuttals(paper_id,author_id,content,created_at) VALUES(?,?,?,?)",
@@ -365,18 +377,29 @@ class ReviewStore:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
-                if not paper or paper["status"] not in {"submitted", "under_review"}:
-                    raise BusinessError("论文不存在或已经决定", 409, "paper_decided")
-                completed = conn.execute("SELECT COUNT(*) FROM assignments WHERE paper_id=? AND status='completed'", (paper_id,)).fetchone()[0]
+                if not paper:
+                    raise BusinessError("论文不存在", 404, "not_found")
+                # 专题主席只能决定本轨；总主席可跨轨决定（含为改轨后的新轨补足意见后决定）。
+                tracks.require_chair_scope(conn, chair, paper["track_id"])
+                if paper["status"] not in PAPER_OPEN_STATUSES:
+                    raise BusinessError("论文已经决定", 409, "paper_decided")
+                completed = assignments.count_valid_completed(conn, paper_id)
                 if completed < 2:
-                    raise BusinessError("至少需要两份已完成评审才能作出决定", 409, "insufficient_reviews")
+                    raise BusinessError(
+                        "至少需要两份当前轨道的已完成评审才能作出决定（改轨前的留档评审不计入）",
+                        409, "insufficient_reviews",
+                    )
                 cur = conn.execute(
                     "INSERT INTO decisions(paper_id,decision,note,decided_by,created_at) VALUES(?,?,?,?,?)",
                     (paper_id, decision, note.strip(), chair_id, utcnow()),
                 )
                 conn.execute("UPDATE papers SET status='decided' WHERE id=?", (paper_id,))
-                self._audit(conn, paper_id, chair_id, "decision.record", {"decision": decision, "note": note.strip()})
-                return {"id": cur.lastrowid, "paper_id": paper_id, "decision": decision, "note": note.strip()}
+                self._audit(conn, paper_id, chair_id, "decision.record",
+                            {"decision": decision, "note": note.strip(), "track_id": paper["track_id"]})
+                result = {"id": cur.lastrowid, "paper_id": paper_id, "decision": decision,
+                          "note": note.strip(), "track_id": paper["track_id"]}
+                conn.commit()
+                return result
             except Exception:
                 conn.rollback()
                 raise
@@ -386,6 +409,26 @@ class ReviewStore:
         with self.connect() as conn:
             rows = conn.execute("SELECT * FROM audit_log WHERE paper_id=? ORDER BY id", (paper_id,)).fetchall()
             return [dict(row) | {"detail": json.loads(row["detail"])} for row in rows]
+
+    def list_tracks(self, user_id: str) -> list[dict]:
+        with self.connect() as conn:
+            self._user(conn, user_id)
+            return tracks.list_tracks(conn)
+
+    def list_assignments(self, user_id: str, paper_id: int) -> list[dict]:
+        """主席页面用：返回论文的全部邀请/评审，含改轨留档状态。"""
+        with self.connect() as conn:
+            user = self._user(conn, user_id)
+            paper = conn.execute("SELECT track_id FROM papers WHERE id=?", (paper_id,)).fetchone()
+            if not paper:
+                raise BusinessError("论文不存在", 404, "not_found")
+            tracks.require_chair_scope(conn, user, paper["track_id"])
+            rows = conn.execute(
+                """SELECT id,reviewer_id,track_id,track_seq,status,score,review_text,updated_at
+                   FROM assignments WHERE paper_id=? ORDER BY id""",
+                (paper_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
 
 
 class ReviewHandler(BaseHTTPRequestHandler):
@@ -425,17 +468,29 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(html)
             return
+        if method == "GET" and path == "/chair":
+            html = (BASE_DIR / "web" / "chair.html").read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html)))
+            self.end_headers()
+            self.wfile.write(html)
+            return
         if method == "GET" and path == "/health":
             return self._send(200, {"ok": True})
         store = self._store()
         parts = [p for p in path.split("/") if p]
         if not parts or parts[0] != "api":
             raise BusinessError("接口不存在", 404, "not_found")
+        if parts == ["api", "tracks"] and method == "GET":
+            return self._send(200, {"items": store.list_tracks(self._user_id())})
         if parts == ["api", "papers"] and method == "GET":
             return self._send(200, {"items": store.list_papers(self._user_id())})
         if parts == ["api", "papers"] and method == "POST":
             data = self._body()
-            return self._send(201, store.submit_paper(self._user_id(), data.get("title", ""), data.get("abstract", "")))
+            return self._send(201, store.submit_paper(
+                self._user_id(), data.get("title", ""), data.get("abstract", ""),
+                data.get("track_id", "")))
         if len(parts) >= 3 and parts[:2] == ["api", "papers"]:
             paper_id = int(parts[2])
             if len(parts) == 3 and method == "GET":
@@ -446,6 +501,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[3] == "conflicts" and method == "POST":
                 data = self._body()
                 return self._send(201, store.add_conflict(self._user_id(), paper_id, data.get("reviewer_id", ""), data.get("reason", "")))
+            if len(parts) == 4 and parts[3] == "assignments" and method == "GET":
+                return self._send(200, {"items": store.list_assignments(self._user_id(), paper_id)})
             if len(parts) == 4 and parts[3] == "assignments" and method == "POST":
                 data = self._body()
                 return self._send(201, store.assign(self._user_id(), paper_id, data.get("reviewer_id", "")))
@@ -455,6 +512,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[3] == "decision" and method == "POST":
                 data = self._body()
                 return self._send(201, store.decide(self._user_id(), paper_id, data.get("decision", ""), data.get("note", "")))
+            if len(parts) == 4 and parts[3] == "track" and method == "POST":
+                data = self._body()
+                return self._send(200, store.move_paper(
+                    self._user_id(), paper_id, data.get("track_id", ""), data.get("reason", "")))
             if len(parts) == 4 and parts[3] == "history" and method == "GET":
                 return self._send(200, {"items": store.history(self._user_id(), paper_id)})
         if len(parts) == 4 and parts[:2] == ["api", "assignments"] and method == "POST":

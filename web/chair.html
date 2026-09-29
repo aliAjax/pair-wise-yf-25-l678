@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>主席控制台 · 分轨评审</title>
+<style>
+body{font:16px system-ui;max-width:1000px;margin:24px auto;padding:0 16px}
+input,textarea,select,button{font:inherit;padding:8px;margin:4px}
+textarea{width:100%;height:64px}
+.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin-bottom:16px}
+pre{white-space:pre-wrap;background:#f4f4f4;padding:12px;font-size:13px}
+table{border-collapse:collapse;width:100%;font-size:14px}td,th{border:1px solid #ccc;padding:6px;text-align:left}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;background:#eef;font-size:12px}
+.tag.archived,.tag.withdrawn{background:#eee;color:#777}
+.tag.completed{background:#dfd}
+.warn{color:#b30}
+a{float:right}
+</style></head>
+<body>
+<h1>主席控制台 <a href="/">← 返回投稿页</a></h1>
+<p>总主席 <code>chair</code> 可跨轨改派；专题主席 <code>chair_db</code> / <code>chair_sys</code> 只能处理本轨论文。改轨后未接受邀请自动撤回，已接受/已完成评审留档（<span class="tag archived">archived</span>），不计入新轨决定。</p>
+
+<section class="panel">
+  <label>主席身份 <select id="user"><option value="chair">chair（总主席）</option><option value="chair_db">chair_db（数据库轨）</option><option value="chair_sys">chair_sys（系统轨）</option></select></label>
+  <button onclick="loadAll()">刷新</button>
+  <span id="scope" class="warn"></span>
+</section>
+
+<section class="panel"><h2>轨道与评审团</h2><pre id="tracks"></pre></section>
+
+<section class="panel">
+  <h2>论文（<span id="scopeName"></span>）</h2>
+  <table><thead><tr><th>ID</th><th>轨道</th><th>标题</th><th>状态</th><th>有效评审</th><th>操作</th></tr></thead>
+  <tbody id="paperRows"></tbody></table>
+</section>
+
+<section class="panel">
+  <h2>论文详情：邀请 / 改轨 / 决定 / 历史</h2>
+  <p>当前论文：<b id="detailId">-</b>（<span id="detailTrack"></span>）</p>
+  <h3>分配与评审</h3>
+  <table><thead><tr><th>分配ID</th><th>评审人</th><th>所属轨/纪元</th><th>状态</th><th>评分</th></tr></thead>
+  <tbody id="assignRows"></tbody></table>
+  <p>邀请评审人（必须属于该轨道评审团）：
+    <select id="reviewerSel"></select><button onclick="invite()">邀请</button></p>
+
+  <h3>改轨（仅总主席）</h3>
+  <p><select id="moveTrack"></select>
+     <input id="moveReason" placeholder="改轨原因（写入审计，至少5字）" size="42">
+     <button onclick="moveTrack()">执行改轨</button></p>
+
+  <h3>决定（需 ≥2 份本轨有效评审）</h3>
+  <p><select id="decision">
+      <option value="accept">accept</option><option value="reject">reject</option>
+      <option value="minor_revision">minor_revision</option><option value="major_revision">major_revision</option>
+    </select>
+    <input id="decisionNote" placeholder="备注" size="30">
+    <button onclick="decide()">作决定</button></p>
+
+  <h3>审计历史</h3><pre id="history"></pre>
+</section>
+
+<script>
+const headers={"Content-Type":"application/json","X-User-Id":"chair"};
+document.querySelector("#user").onchange=e=>{headers["X-User-Id"]=e.target.value;loadAll()};
+let TRACKS=[], PAPERS=[];
+async function api(url,opt={}){const r=await fetch(url,{...opt,headers});const j=await r.json();if(!r.ok)alert("错误 "+r.status+"："+(j.error?.message||JSON.stringify(j)));return {ok:r.ok,body:j}}
+
+async function loadAll(){
+  const [t,p]=await Promise.all([api("/api/tracks"),api("/api/papers")]);
+  TRACKS=t.body.items||[];PAPERS=p.body.items||[];
+  const uid=headers["X-User-Id"];
+  const mine=TRACKS.find(x=>x.chair_id===uid);
+  scope.textContent=mine?`当前为专题主席，仅显示 ${mine.id} 轨`:"当前为总主席，可跨轨操作";
+  scopeName.textContent=mine?mine.id+" 轨":"全部轨道";
+  tracks.textContent=JSON.stringify(TRACKS,null,2);
+  paperRows.innerHTML=PAPERS.map(x=>`<tr><td>${x.id}</td><td><span class="tag">${x.track_id}</span></td>
+    <td>${x.title}</td><td>${x.status}</td><td id="valid_${x.id}">…</td>
+    <td><button onclick="openPaper(${x.id})">打开</button></td></tr>`).join("");
+  PAPERS.forEach(x=>loadValidCount(x.id));
+  reviewerSel.innerHTML=TRACKS.flatMap(t=>t.reviewer_ids.map(r=>`<option value="${r}">${r}（${t.id}）</option>`)).join("");
+  moveTrack.innerHTML=TRACKS.map(t=>`<option value="${t.id}">${t.id} — ${t.name}</option>`).join("");
+}
+
+async function loadValidCount(id){
+  const {body}=await api(`/api/papers/${id}/assignments`);
+  const valid=(body.items||[]).filter(a=>a.status==="completed"
+    && PAPERS.find(p=>p.id===id)?.track_id===a.track_id).length;
+  document.querySelector("#valid_"+id).textContent=valid;
+}
+
+async function openPaper(id){
+  const paper=PAPERS.find(x=>x.id===id);
+  detailId.textContent=id;detailTrack.textContent=paper.track_id;
+  moveTrack.value=paper.track_id===moveTrack.value?moveTrack.value:paper.track_id;
+  await Promise.all([loadAssignments(id),loadHistory(id)]);
+}
+async function loadAssignments(id){
+  const {body}=await api(`/api/papers/${id}/assignments`);
+  assignRows.innerHTML=(body.items||[]).map(a=>`<tr><td>${a.id}</td><td>${a.reviewer_id}</td>
+    <td>${a.track_id} #${a.track_seq}</td><td><span class="tag ${a.status}">${a.status}</span></td>
+    <td>${a.score??"-"}</td></tr>`).join("");
+}
+async function loadHistory(id){
+  const {body}=await api(`/api/papers/${id}/history`);
+  history.textContent=JSON.stringify(body.items||[],null,2);
+}
+function currentPaper(){return parseInt(detailId.textContent)}
+async function invite(){
+  await api(`/api/papers/${currentPaper()}/assignments`,{method:"POST",body:JSON.stringify({reviewer_id:reviewerSel.value})});
+  await loadAssignments(currentPaper());
+}
+async function moveTrack(){
+  const r=await api(`/api/papers/${currentPaper()}/track`,{method:"POST",
+    body:JSON.stringify({track_id:moveTrack.value,reason:moveReason.value})});
+  if(r.ok){moveReason.value="";await loadAll();await openPaper(currentPaper());}
+}
+async function decide(){
+  const r=await api(`/api/papers/${currentPaper()}/decision`,{method:"POST",
+    body:JSON.stringify({decision:decision.value,note:decisionNote.value})});
+  if(r.ok){await loadAll();await loadHistory(currentPaper());}
+}
+loadAll();
+</script></body></html>
