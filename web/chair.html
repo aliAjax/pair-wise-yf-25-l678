@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>主席工作台</title>
+<style>
+body{font:15px system-ui;max-width:1000px;margin:24px auto;padding:0 16px}
+input,textarea,select,button{font:inherit;padding:6px;margin:2px}
+.panel{border:1px solid #bbb;padding:14px;border-radius:8px;margin:12px 0}
+pre{white-space:pre-wrap;background:#f4f4f4;padding:10px;max-height:340px;overflow:auto}
+.paper{border-bottom:1px solid #ddd;padding:10px 0}
+.tag{display:inline-block;background:#eef;padding:1px 8px;border-radius:10px;font-size:12px;margin-right:6px}
+.muted{color:#888;font-size:12px}
+</style></head>
+<body>
+<h1>主席工作台</h1>
+<p>
+  <a href="/">← 返回投稿/评审演示页</a>
+</p>
+<section class="panel">
+  <label>当前身份
+    <select id="user">
+      <option value="chair">chair（总主席，可跨轨）</option>
+      <option value="chair_ds">chair_ds（分布式轨主席，仅限本轨）</option>
+      <option value="chair_ai">chair_ai（人工智能轨主席，仅限本轨）</option>
+    </select>
+  </label>
+  <button onclick="loadPapers()">刷新论文列表</button>
+  <span class="muted">专题主席只能看到并处理本轨论文；改轨仅总主席可用。</span>
+</section>
+<section class="panel"><h2>论文</h2><div id="papers"></div></section>
+
+<template id="paperTpl">
+  <div class="paper">
+    <strong class="p-title"></strong> <span class="tag p-track"></span><span class="tag p-status"></span>
+    <div class="muted p-meta"></div>
+    <div>
+      <input class="p-reviewer" placeholder="评审人 id（r1/r2/r3）" style="width:170px">
+      <button class="p-assign">邀请评审（须同轨）</button>
+      <input class="p-conflict" placeholder="冲突评审人 id" style="width:140px">
+      <input class="p-reason" placeholder="冲突原因" style="width:180px">
+      <button class="p-conflict-btn">登记利益冲突</button>
+    </div>
+    <div class="move-box">
+      <select class="p-target"></select>
+      <input class="p-move-reason" placeholder="改轨原因（必填）" style="width:260px">
+      <button class="p-move">改轨（仅总主席）</button>
+    </div>
+    <div>
+      <select class="p-decision">
+        <option>accept</option><option>reject</option>
+        <option>minor_revision</option><option>major_revision</option>
+      </select>
+      <input class="p-note" placeholder="决定说明" style="width:260px">
+      <button class="p-decide">作决定（需两份本轨有效意见）</button>
+      <button class="p-history">查看审计历史</button>
+    </div>
+    <pre class="p-out" hidden></pre>
+  </div>
+</template>
+
+<script>
+const $=s=>document.querySelector(s);
+const headers={"Content-Type":"application/json"};
+$("#user").onchange=e=>headers["X-User-Id"]=e.target.value;
+headers["X-User-Id"]=$("#user").value;
+let TRACKS=[];
+
+async function api(url,opt={}){
+  const r=await fetch(url,{...opt,headers});
+  const data=await r.json();
+  if(!r.ok) throw new Error((data.error&&data.error.code+" "+data.error.message)||r.status);
+  return data;
+}
+function out(el,data){el.hidden=false;el.textContent=JSON.stringify(data,null,2)}
+
+async function loadTracks(){
+  const d=await api("/api/tracks");TRACKS=d.items||[];
+}
+async function loadPapers(){
+  const data=await api("/api/papers");
+  const box=$("#papers");box.innerHTML="";
+  for(const p of data.items){
+    const node=$("#paperTpl").content.cloneNode(true);
+    node.querySelector(".p-title").textContent="#"+p.id+" "+p.title;
+    const track=TRACKS.find(t=>t.id===p.track_id);
+    node.querySelector(".p-track").textContent=(track?track.name:p.track_id);
+    node.querySelector(".p-status").textContent=p.status;
+    node.querySelector(".p-meta").textContent="作者（仅主席可见）:"+(p.author_id||"双盲隐藏");
+    node.querySelector(".p-target").innerHTML=
+      TRACKS.filter(t=>t.id!==p.track_id).map(t=>`<option value="${t.id}">${t.name}</option>`).join("");
+    const pid=p.id, o=node.querySelector(".p-out");
+    node.querySelector(".p-assign").onclick=async()=>{
+      try{out(o,await api(`/api/papers/${pid}/assignments`,{method:"POST",
+        body:JSON.stringify({reviewer_id:node.querySelector(".p-reviewer").value})}))}catch(e){out(o,{error:String(e)})}
+    };
+    node.querySelector(".p-conflict-btn").onclick=async()=>{
+      try{out(o,await api(`/api/papers/${pid}/conflicts`,{method:"POST",body:JSON.stringify({
+        reviewer_id:node.querySelector(".p-conflict").value,reason:node.querySelector(".p-reason").value})}))}
+      catch(e){out(o,{error:String(e)})}
+    };
+    node.querySelector(".p-move").onclick=async()=>{
+      try{out(o,await api(`/api/papers/${pid}/move`,{method:"POST",body:JSON.stringify({
+        target_track_id:node.querySelector(".p-target").value,
+        reason:node.querySelector(".p-move-reason").value})}));loadPapers()}
+      catch(e){out(o,{error:String(e)})}
+    };
+    node.querySelector(".p-decide").onclick=async()=>{
+      try{out(o,await api(`/api/papers/${pid}/decision`,{method:"POST",body:JSON.stringify({
+        decision:node.querySelector(".p-decision").value,note:node.querySelector(".p-note").value})}))}
+      catch(e){out(o,{error:String(e)})}
+    };
+    node.querySelector(".p-history").onclick=async()=>{
+      try{out(o,(await api(`/api/papers/${pid}/history`)).items)}catch(e){out(o,{error:String(e)})}
+    };
+    box.appendChild(node);
+  }
+}
+(async()=>{await loadTracks();await loadPapers()})();
+</script>
+</body></html>
